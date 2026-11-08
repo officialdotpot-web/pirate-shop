@@ -1,0 +1,13 @@
+{
+  "name": "pirate-live-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local TikTok LIVE bridge for the Pirate Shop gift page",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "tiktok-live-connector": "^2.5.0"
+  }
+}
