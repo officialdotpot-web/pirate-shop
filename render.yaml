@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: pirate-shop-live
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: cd server && npm ci
+    startCommand: cd server && npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 20.20.2
+      - key: BRIDGE_PASSWORD
+        generateValue: true
