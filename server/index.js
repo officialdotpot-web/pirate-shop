@@ -128,20 +128,34 @@ function statusEvent(extra = {}){
 let queue = [], nextQueueId = 1;
 let queueRules = { enabled:true, names:['Hand Hearts','Money Gun','Galaxy'], ids:['','',''] };
 const MAX_QUEUE = 500;
-let activeRequest=null, queueCooldown=false, completed=[];
+let activeRequest=null, activePhase=null, queueCooldown=false, cooldownTimer=null, stageTimers=[], completed=[];
 function queueEvent(){ broadcast({type:'queue', items: queue}); pumpQueue(); }
+function clearStages(){ stageTimers.forEach(clearTimeout);stageTimers=[]; }
+function cancelActive(){
+  if(!activeRequest) return;
+  const cancelled=activeRequest;clearStages();activeRequest=null;activePhase=null;
+  broadcast({type:'auto_cancel',item:cancelled});queueEvent();
+}
 function pumpQueue(){
-  if(activeRequest || queueCooldown || !queue.length || !queue[0].fn) return;
-  activeRequest={...queue[0]};
+  if(!queueRules.enabled || activeRequest || queueCooldown || !queue.length || !queue[0].fn) return;
+  activeRequest={...queue[0]};activePhase='select';
+  const requestId=activeRequest.id;
   broadcast({type:'auto_started', item:activeRequest});
-  setTimeout(()=>{
-    const done=activeRequest; if(!done) return;
+  ['checkout','confirm','loading'].forEach((stage,index)=>{
+    stageTimers.push(setTimeout(()=>{
+      if(!activeRequest || activeRequest.id!==requestId) return;
+      activePhase=stage;broadcast({type:'auto_stage',stage,item:activeRequest});
+    },(index+1)*1000));
+  });
+  stageTimers.push(setTimeout(()=>{
+    if(!activeRequest || activeRequest.id!==requestId) return;
+    const done=activeRequest;clearStages();
     queue=queue.filter(item=>item.id!==done.id);
-    activeRequest=null; queueCooldown=true;
-    completed.unshift({...done, completedAt:Date.now()});completed=completed.slice(0,50);
-    broadcast({type:'auto_done', item:done});queueEvent();
-    setTimeout(()=>{queueCooldown=false;pumpQueue();},1800);
-  },2000);
+    activeRequest=null;activePhase=null;queueCooldown=true;
+    completed.unshift({...done,completedAt:Date.now()});completed=completed.slice(0,50);
+    broadcast({type:'auto_done',item:done});queueEvent();
+    cooldownTimer=setTimeout(()=>{queueCooldown=false;pumpQueue();},1100);
+  },4000));
 }
 function key(v){ return String(v || '').toLocaleLowerCase().replace(/[^a-z0-9]/g,''); }
 function sameUser(a,b){ return String(a || '').toLocaleLowerCase() === String(b || '').toLocaleLowerCase(); }
@@ -398,6 +412,7 @@ const server = http.createServer(async (req, res) => {
     const body=await readBody(req);
     if(!Array.isArray(body.names) || body.names.length!==3 || !Array.isArray(body.ids) || body.ids.length!==3) return json(res,400,{ok:false});
     queueRules={enabled:!!body.enabled,names:body.names.map(x=>String(x || '').slice(0,100)),ids:body.ids.map(x=>String(x || '').slice(0,50))};
+    if(!queueRules.enabled) cancelActive(); else pumpQueue();
     return json(res,200,{ok:true,rules:queueRules});
   }
   if (pathname === '/api/queue' && req.method === 'GET') return json(res,200,{ok:true,items:queue,active:activeRequest,completed});
@@ -460,7 +475,10 @@ const server = http.createServer(async (req, res) => {
     }) + '\n\n');
     res.write('data: ' + JSON.stringify({type:'queue',items:queue}) + '\n\n');
     res.write('data: ' + JSON.stringify({type:'history',items:completed}) + '\n\n');
-    if(activeRequest) res.write('data: ' + JSON.stringify({type:'auto_started',item:activeRequest}) + '\n\n');
+    if(activeRequest){
+      res.write('data: ' + JSON.stringify({type:'auto_started',item:activeRequest}) + '\n\n');
+      if(activePhase && activePhase!=='select') res.write('data: ' + JSON.stringify({type:'auto_stage',stage:activePhase,item:activeRequest}) + '\n\n');
+    }
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch(e){} }, 15000);
     req.on('close', () => { clearInterval(ping); clients.delete(res); });
     return;
