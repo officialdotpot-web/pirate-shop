@@ -55,7 +55,9 @@ const state = {
   demoTimer: null,
   error: null,
   startedAt: null,
-  seq: 0
+  seq: 0,
+  chatMessages: 0, usernamesFound: 0, lastChatAt: null,
+  desiredUsername: String(process.env.TIKTOK_USERNAME || '').replace(/^@+/, '').trim()
 };
 
 const clients = new Set();  // SSE response objects
@@ -81,9 +83,18 @@ const MIME = {
   '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.ico': 'image/x-icon'
 };
 
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+function originAllowed(req){
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try { return new URL(origin).host === req.headers.host || ALLOWED_ORIGINS.includes(origin); }
+  catch { return false; }
+}
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const origin = res.req?.headers.origin;
+  if (origin && originAllowed(res.req)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
 }
 
@@ -113,18 +124,91 @@ function statusEvent(extra = {}){
   }, extra));
 }
 
+/* Shared in-memory queue: maintained by the bridge even when the browser is closed. */
+let queue = [], nextQueueId = 1;
+let queueRules = { enabled:true, names:['Hand Hearts','Money Gun','Galaxy'], ids:['','',''] };
+const MAX_QUEUE = 500;
+let activeRequest=null, queueCooldown=false, completed=[];
+function queueEvent(){ broadcast({type:'queue', items: queue}); pumpQueue(); }
+function pumpQueue(){
+  if(activeRequest || queueCooldown || !queue.length || !queue[0].fn) return;
+  activeRequest={...queue[0]};
+  broadcast({type:'auto_started', item:activeRequest});
+  setTimeout(()=>{
+    const done=activeRequest; if(!done) return;
+    queue=queue.filter(item=>item.id!==done.id);
+    activeRequest=null; queueCooldown=true;
+    completed.unshift({...done, completedAt:Date.now()});completed=completed.slice(0,50);
+    broadcast({type:'auto_done', item:done});queueEvent();
+    setTimeout(()=>{queueCooldown=false;pumpQueue();},1800);
+  },2000);
+}
+function key(v){ return String(v || '').toLocaleLowerCase().replace(/[^a-z0-9]/g,''); }
+function sameUser(a,b){ return String(a || '').toLocaleLowerCase() === String(b || '').toLocaleLowerCase(); }
+const CHAT_FILLER = new Set(('please pls plz plss plzzz pleasse thank thanks thankyou thankyouu you yours your yourself can could would should wanna want wanted gonna gotta doing does doesnot dont donttt just really actually maybe take pick choose send give gift gifted gifting username user epic fortnite account name named accounts mine minee hello hey hi there this that those these with without will wont from then them they their there here again againnn first next other another everyone everybody whoever someone anyone anyoneee somebody people person player players random comment comments message chat twitch tiktok live stream streamer bro bruh dude boss friend buddy man girl boy mate dude awesome amazing nice great cool pleaseee pleaseeee plssss thats thats great okay okayy yeah yess yes no nope now right left time today tonight game playing good well better best wanttt lets gooooo trying tryinggg hurry hurryup little littlee plssssssss do it for me and the you are have has its itsmy my me to is i of a an in on at up as by or if we us im am be so do for my fn epic id userr').split(' '));
+function parseChatName(message){
+  const text=String(message || '').trim().slice(0,200);
+  if(!text) return null;
+  const clean=s=>String(s || '').trim().replace(/^@+/, '');
+  const valid=s=>s.length>=5 && s.length<=32 && /^[\p{L}\p{N} ._\-]+$/u.test(s);
+  const explicit=text.match(/^!gift\s+(.+)$/i) || text.match(/["“]([^"”]+)["”]/);
+  if(explicit){const v=clean(explicit[1]);return valid(v)?v:null;}
+  const tokens=text.match(/@?[\p{L}\p{N}_.-]+/gu) || [];
+  let best=null, score=-Infinity;
+  for(const raw of tokens){
+    const v=clean(raw).replace(/^[.\-]+|[.\-]+$/g,'');
+    if(!valid(v) || CHAT_FILLER.has(v.toLocaleLowerCase()) || !/[\p{L}\p{N}]/u.test(v)) continue;
+    const hasLetter=/[\p{L}]/u.test(v), hasDigit=/[0-9]/.test(v), hasSymbol=/[_.-]/.test(v);
+    let n=(raw.startsWith('@')?120:0)+(hasSymbol?55:0)+(hasLetter && hasDigit?45:0)+(!hasLetter && hasDigit?8:0)+(/[a-z][A-Z]/.test(v)?8:0)+Math.min(v.length,20)/10;
+    if(n>=score){best=v;score=n;}
+  }
+  return best;
+}
+function matchGift(name,id){
+  const n=key(name), gid=String(id || '');
+  return queueRules.names.findIndex((rule,i)=>{
+    const r=key(rule); if(!r) return false;
+    if(r==='handheart'||r==='handhearts') return n.includes('handheart') || ['5660','5924','6968','8343'].includes(gid);
+    if(gid && queueRules.ids[i]) return gid === String(queueRules.ids[i]);
+    return !!n && n === r;
+  });
+}
+function queueChat(who,comment){
+  if(!queueRules.enabled || !who) return;
+  const fn=parseChatName(comment); if(!fn) return;
+  state.usernamesFound++;
+  const existing=queue.find(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
+  if(existing){ existing.fn=fn; }
+  else if(activeRequest && sameUser(activeRequest.who,who)) return;
+  else if(queue.length<MAX_QUEUE){ queue.push({id:String(nextQueueId++),who,fn,bundle:1,gift:null,priority:false}); }
+  queueEvent();
+}
+function queueGift(who,name,id){
+  if(!queueRules.enabled || !who) return;
+  const bundle=matchGift(name,id);if(bundle<0) return;
+  const index=queue.findIndex(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
+  let entry=index>=0 ? queue.splice(index,1)[0] : null;
+  if(!entry && queue.length>=MAX_QUEUE) return;
+  if(!entry) entry={id:String(nextQueueId++),who,fn:activeRequest && sameUser(activeRequest.who,who) ? activeRequest.fn : null};
+  entry.bundle=bundle;entry.gift=name;entry.priority=true;
+  queue.unshift(entry);queueEvent();
+}
+
 /* ---------- event normalisation ---------- */
 function person(user){
-  if (!user) return { username: 'viewer', nickname: 'Viewer', avatar: null };
+  if (!user) return { username: '', nickname: 'Viewer', avatar: null };
   return {
-    username: user.uniqueId || user.nickname || 'viewer',
+    username: user.uniqueId || '',
     nickname: user.nickname || user.uniqueId || 'Viewer',
     avatar: (user.profilePicture && (user.profilePicture.url || user.profilePicture[0])) || null
   };
 }
 
 function emitChat(data){
-  broadcast({ type: 'chat', user: person(data.user), comment: data.comment || '', ts: Date.now() });
+  const user=person(data.user), comment=data.comment || '';
+  state.chatMessages++;state.lastChatAt=Date.now();
+  broadcast({ type: 'chat', user, comment, serverQueue:true, ts: Date.now() });
+  queueChat(user.username,comment);
 }
 function emitGift(data){
   // TikTok streaks emit progress and an end event. Only process the final event.
@@ -132,12 +216,10 @@ function emitGift(data){
   if (Number(giftType) === 1 && !data.repeatEnd) return;
   const repeat = data.repeatCount || 1;
   const coins = (data.diamondCount || data.giftDetails?.diamondCount || 1) * repeat;
-  broadcast({
-    type: 'gift', user: person(data.user),
-    giftName: data.giftName || data.giftDetails?.giftName || data.extendedGiftInfo?.name || 'Gift',
-    giftId: data.giftId || null,
-    coins, repeatCount: repeat, ts: Date.now()
-  });
+  const user=person(data.user), giftName=data.giftName || data.giftDetails?.giftName || data.extendedGiftInfo?.name || 'Gift';
+  const giftId=data.giftId || null;
+  broadcast({type:'gift',user,giftName,giftId,coins,repeatCount:repeat,serverQueue:true,ts:Date.now()});
+  queueGift(user.username,giftName,giftId);
 }
 function emitJoin(data){ broadcast({ type: 'join', user: person(data.user), ts: Date.now() }); }
 function emitFollow(data){ broadcast({ type: 'follow', user: person(data.user), ts: Date.now() }); }
@@ -146,9 +228,10 @@ function emitLike(data){ broadcast({ type: 'like', user: person(data.user), coun
 
 /* ---------- connection ---------- */
 async function connectLive(username, demo){
-  disconnectLive();
+  disconnectLive(false);
 
   state.seq++;
+  const session = state.seq;
   state.username = String(username || '').replace(/^@+/, '').trim();
   state.error = null;
 
@@ -185,22 +268,26 @@ async function connectLive(username, demo){
     if (count !== state.viewers){ state.viewers = count; broadcast({ type: 'viewers', count, ts: Date.now() }); }
   });
   connection.on('disconnect', () => {
+    if (state.seq !== session) return;
     state.connected = false; state.connecting = false; state.connection = null;
     statusEvent({ message: 'Disconnected from TikTok' });
   });
   connection.on('error', err => {
+    if (state.seq !== session) return;
     state.error = friendlyError(err?.message || err, state.username);
     statusEvent();
   });
 
   try {
     await connection.connect();
+    if (state.seq !== session){ try { await connection.disconnect(); } catch {} return; }
     state.connected = true;
     state.connecting = false;
     state.startedAt = Date.now();
     statusEvent();
     console.log(`[bridge] connected to @${state.username}`);
   } catch (err){
+    if (state.seq !== session) return;
     state.connected = false;
     state.connecting = false;
     state.connection = null;
@@ -210,13 +297,14 @@ async function connectLive(username, demo){
   }
 }
 
-function disconnectLive(){
+function disconnectLive(disableAuto = true){
+  if (disableAuto) state.desiredUsername = '';
   if (state.demoTimer){ clearInterval(state.demoTimer); state.demoTimer = null; }
   state.seq++;
   state.error = null;
   state.demo = false;
   if (state.connection){
-    try { state.connection.disconnect(); } catch(e){}
+    try { Promise.resolve(state.connection.disconnect()).catch(() => {}); } catch(e){}
   }
   state.connection = null;
   state.connected = false;
@@ -239,6 +327,7 @@ function startDemo(username){
   statusEvent();
 
   let tick = 0;
+  if (process.env.DEMO_RANDOM === 'false') return; // deterministic testing
   state.demoTimer = setInterval(() => {
     tick++;
     const user = DEMO_NAMES[Math.floor(Math.random() * DEMO_NAMES.length)];
@@ -286,23 +375,38 @@ const server = http.createServer(async (req, res) => {
 
   // Only a minimal unauthenticated liveness endpoint is public.
   if (pathname === '/healthz' && req.method === 'GET') return json(res, 200, { ok: true });
-  // Prevent cross-site form requests from controlling the authenticated bridge.
-  if (BRIDGE_PASSWORD && ['POST','PUT','PATCH','DELETE'].includes(req.method) && req.headers.origin){
-    try { if (new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, {ok:false, error:'Origin not allowed'}); }
-    catch { return json(res, 403, {ok:false, error:'Origin not allowed'}); }
-  }
+  // Allow only the configured website origin; preflight must not require credentials.
+  if (req.headers.origin && !originAllowed(req)) return json(res, 403, {ok:false, error:'Origin not allowed'});
+  if (req.method === 'OPTIONS'){ cors(res); res.writeHead(204); return res.end(); }
   if (!authorized(req)){
+    cors(res);
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Pirate Shop Bridge", charset="UTF-8"', 'Cache-Control':'no-store', 'Content-Type':'text/plain; charset=utf-8' });
     return res.end('Authentication required');
   }
-  if (req.method === 'OPTIONS'){ cors(res); res.writeHead(204); return res.end(); }
 
   /* --- api --- */
   if (pathname === '/api/health'){
     return json(res, 200, {
       ok: true, connected: state.connected, connecting: state.connecting,
-      username: state.username, viewers: state.viewers, demo: state.demo, error: state.error
+      username: state.username, viewers: state.viewers, demo: state.demo, error: state.error,
+      automationVersion: 2, chatMessages: state.chatMessages, usernamesFound: state.usernamesFound, lastChatAt: state.lastChatAt
     });
+  }
+
+  if (pathname === '/api/config' && req.method === 'GET') return json(res, 200, {ok:true, rules:queueRules});
+  if (pathname === '/api/config' && req.method === 'POST'){
+    const body=await readBody(req);
+    if(!Array.isArray(body.names) || body.names.length!==3 || !Array.isArray(body.ids) || body.ids.length!==3) return json(res,400,{ok:false});
+    queueRules={enabled:!!body.enabled,names:body.names.map(x=>String(x || '').slice(0,100)),ids:body.ids.map(x=>String(x || '').slice(0,50))};
+    return json(res,200,{ok:true,rules:queueRules});
+  }
+  if (pathname === '/api/queue' && req.method === 'GET') return json(res,200,{ok:true,items:queue,active:activeRequest,completed});
+  if (pathname === '/api/queue/remove' && req.method === 'POST'){
+    const body=await readBody(req), old=queue.length;
+    if(activeRequest && activeRequest.id === String(body.id || '')) return json(res,409,{ok:false,error:'Request already processing'});
+    queue=queue.filter(x=>x.id!==String(body.id || ''));
+    if(queue.length!==old) queueEvent();
+    return json(res,200,{ok:true,removed:queue.length!==old});
   }
 
   if (pathname === '/api/gifts' && req.method === 'GET'){
@@ -320,6 +424,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const username = (body.username || '').toString();
     const demo = !!body.demo;
+    state.desiredUsername = demo ? '' : username.replace(/^@+/, '').trim();
     if (!username && !demo) return json(res, 400, { ok: false, error: 'username required' });
     connectLive(username, demo);          // fire and forget; status arrives over SSE
     return json(res, 202, { ok: true, connecting: true, username, demo });
@@ -353,6 +458,9 @@ const server = http.createServer(async (req, res) => {
       type: 'status', seq: state.seq, connected: state.connected, connecting: state.connecting,
       username: state.username, viewers: state.viewers, demo: state.demo, error: state.error
     }) + '\n\n');
+    res.write('data: ' + JSON.stringify({type:'queue',items:queue}) + '\n\n');
+    res.write('data: ' + JSON.stringify({type:'history',items:completed}) + '\n\n');
+    if(activeRequest) res.write('data: ' + JSON.stringify({type:'auto_started',item:activeRequest}) + '\n\n');
     const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch(e){} }, 15000);
     req.on('close', () => { clearInterval(ping); clients.delete(res); });
     return;
@@ -373,4 +481,12 @@ function readBody(req){
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n  Pirate Shop bridge running\n  page:  http://localhost:${PORT}\n  api:   http://localhost:${PORT}/api/health\n`);
+  if (state.desiredUsername) connectLive(state.desiredUsername, false);
+  setInterval(() => {
+    if (state.desiredUsername && !state.connected && !state.connecting && !state.demo) {
+      console.log('[bridge] retrying LIVE connection');
+      connectLive(state.desiredUsername, false);
+    }
+  }, 60000);
+
 });
