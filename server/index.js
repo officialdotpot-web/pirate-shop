@@ -217,13 +217,20 @@ function queueChat(who,comment){
   if(!queueRules.enabled || !who) return;
   const fn=parseChatName(comment);if(!fn) return;
   state.usernamesFound++;rememberName(who,fn);
-  // Fill every unfulfilled request from this viewer, including timed-out gifts.
-  const entries=queue.filter(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
-  if(entries.length){for(const entry of entries){entry.fn=fn;entry.waitStartedAt=null;}}
-  else if(activeRequest && sameUser(activeRequest.who,who)) return;
-  else if(queue.length<MAX_QUEUE) queue.push({id:String(nextQueueId++),who,fn,bundle:1,gift:null,priority:false});
+  // Keep the request already running and all gift requests, but discard older
+  // waiting ordinary chat requests: only the newest valid comment is needed.
+  queue=queue.filter(x=>x.priority || x.id===activeRequest?.id);
+  // A gifter's comment resolves all of their waiting gifts, even after the timer.
+  const gifts=queue.filter(x=>x.priority && sameUser(x.who,who) && x.id!==activeRequest?.id);
+  if(gifts.length){
+    for(const entry of gifts){entry.fn=fn;entry.waitStartedAt=null;}
+  }else if(queue.length<MAX_QUEUE){
+    // New comments from the same viewer are also allowed after the current request.
+    queue.push({id:String(nextQueueId++),who,fn,bundle:1,gift:null,priority:false});
+  }
   queueEvent();
 }
+
 function queueGift(who,name,id){
   if(!queueRules.enabled || !who) return;
   const special=isHandHeart(name,id) && isPromoActive();
