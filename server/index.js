@@ -126,7 +126,7 @@ function statusEvent(extra = {}){
 
 /* Shared in-memory queue: maintained by the bridge even when the browser is closed. */
 let queue = [], nextQueueId = 1;
-let queueRules = { enabled:true, names:['Hand Hearts','Money Gun','Galaxy'], ids:['','',''] };
+let queueRules = { enabled:true, names:['Money Gun','Hand Hearts','Galaxy'], ids:['','',''] };
 const MAX_QUEUE = 500;
 let activeRequest=null, activePhase=null, queueCooldown=false, cooldownTimer=null, stageTimers=[], completed=[];
 function queueEvent(){ broadcast({type:'queue', items: queue}); pumpQueue(); }
@@ -211,26 +211,28 @@ function queueGift(who,name,id){
 /* ---------- event normalisation ---------- */
 function person(user){
   if (!user) return { username: '', nickname: 'Viewer', avatar: null };
+  // Connector releases emit either legacy uniqueId/comment fields or protobuf v3 displayId/content.
+  const username=String(user.uniqueId || user.displayId || user.idStr || user.id || '').trim();
   return {
-    username: user.uniqueId || '',
-    nickname: user.nickname || user.uniqueId || 'Viewer',
-    avatar: (user.profilePicture && (user.profilePicture.url || user.profilePicture[0])) || null
+    username,
+    nickname: user.nickname || username || 'Viewer',
+    avatar: user.profilePicture?.url?.[0] || user.profilePicture?.url || user.profilePicture?.[0] || user.avatarThumb?.url?.[0] || null
   };
 }
 
 function emitChat(data){
-  const user=person(data.user), comment=data.comment || '';
+  const user=person(data.user), comment=typeof data.comment==='string' ? data.comment : (typeof data.content==='string' ? data.content : '');
   state.chatMessages++;state.lastChatAt=Date.now();
   broadcast({ type: 'chat', user, comment, serverQueue:true, ts: Date.now() });
   queueChat(user.username,comment);
 }
 function emitGift(data){
   // TikTok streaks emit progress and an end event. Only process the final event.
-  const giftType = data.giftDetails?.giftType ?? data.giftType;
-  if (Number(giftType) === 1 && !data.repeatEnd) return;
+  const giftType = data.giftDetails?.giftType ?? data.giftType ?? data.gift?.type;
+  if ((Number(giftType) === 1 || data.gift?.combo === true) && !data.repeatEnd) return;
   const repeat = data.repeatCount || 1;
-  const coins = (data.diamondCount || data.giftDetails?.diamondCount || 1) * repeat;
-  const user=person(data.user), giftName=data.giftName || data.giftDetails?.giftName || data.extendedGiftInfo?.name || 'Gift';
+  const coins = (data.diamondCount || data.giftDetails?.diamondCount || data.gift?.diamondCount || 1) * repeat;
+  const user=person(data.user), giftName=data.giftName || data.giftDetails?.giftName || data.gift?.name || data.extendedGiftInfo?.name || 'Gift';
   const giftId=data.giftId || null;
   broadcast({type:'gift',user,giftName,giftId,coins,repeatCount:repeat,serverQueue:true,ts:Date.now()});
   queueGift(user.username,giftName,giftId);
@@ -281,14 +283,17 @@ async function connectLive(username, demo){
     const count = data?.viewerCount ?? 0;
     if (count !== state.viewers){ state.viewers = count; broadcast({ type: 'viewers', count, ts: Date.now() }); }
   });
-  connection.on('disconnect', () => {
-    if (state.seq !== session) return;
+  const onDisconnected=() => {
+    if (state.seq !== session || state.connection !== connection) return;
     state.connected = false; state.connecting = false; state.connection = null;
     statusEvent({ message: 'Disconnected from TikTok' });
-  });
+  };
+  connection.on('disconnect', onDisconnected);
+  connection.on('disconnected', onDisconnected);
   connection.on('error', err => {
     if (state.seq !== session) return;
-    state.error = friendlyError(err?.message || err, state.username);
+    const cause=err?.exception || err?.error || err;
+    state.error = friendlyError(cause?.message || (typeof cause==='string' ? cause : err?.info) || 'TikTok connection error', state.username);
     statusEvent();
   });
 
