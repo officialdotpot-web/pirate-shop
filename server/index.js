@@ -129,7 +129,7 @@ let queue = [], nextQueueId = 1;
 let queueRules = { enabled:true, names:['Money Gun','Hand Hearts','Galaxy'], ids:['','',''] };
 const MAX_QUEUE = 500;
 let activeRequest=null, activePhase=null, queueCooldown=false, cooldownTimer=null, stageTimers=[], completed=[];
-function queueEvent(){ broadcast({type:'queue', items: queue}); pumpQueue(); }
+function queueEvent(){ broadcast({type:'queue', items: queue, serverNow:Date.now()}); pumpQueue(); }
 function clearStages(){ stageTimers.forEach(clearTimeout);stageTimers=[]; }
 function cancelActive(){
   if(!activeRequest) return;
@@ -137,11 +137,12 @@ function cancelActive(){
   broadcast({type:'auto_cancel',item:cancelled});queueEvent();
 }
 function pumpQueue(){
-  if(!queueRules.enabled || activeRequest || queueCooldown || !queue.length || !queue[0].fn) return;
-  activeRequest={...queue[0]};activePhase='select';
+  if(!queueRules.enabled || activeRequest || queueCooldown) return;
+  const next=queue.find(item=>item.fn);if(!next) return;
+  activeRequest={...next};activePhase='select';
   const requestId=activeRequest.id;
   broadcast({type:'auto_started', item:activeRequest});
-  ['checkout','confirm','loading'].forEach((stage,index)=>{
+  ['selected','checkout','confirm','loading'].forEach((stage,index)=>{
     stageTimers.push(setTimeout(()=>{
       if(!activeRequest || activeRequest.id!==requestId) return;
       activePhase=stage;broadcast({type:'auto_stage',stage,item:activeRequest});
@@ -155,7 +156,7 @@ function pumpQueue(){
     completed.unshift({...done,completedAt:Date.now()});completed=completed.slice(0,50);
     broadcast({type:'auto_done',item:done});queueEvent();
     cooldownTimer=setTimeout(()=>{queueCooldown=false;pumpQueue();},1100);
-  },4000));
+  },5000));
 }
 function key(v){ return String(v || '').toLocaleLowerCase().replace(/[^a-z0-9]/g,''); }
 function sameUser(a,b){ return String(a || '').toLocaleLowerCase() === String(b || '').toLocaleLowerCase(); }
@@ -187,26 +188,60 @@ function matchGift(name,id){
     return !!n && n === r;
   });
 }
+// Remember a viewer's most recently provided Fortnite name while this bridge is running.
+const knownNames=new Map();
+const MAX_KNOWN_NAMES=5000;
+function userKey(who){ return String(who || '').toLocaleLowerCase().trim(); }
+function rememberName(who,fn){
+  const k=userKey(who);if(!k)return;
+  knownNames.delete(k);knownNames.set(k,fn);
+  if(knownNames.size>MAX_KNOWN_NAMES) knownNames.delete(knownNames.keys().next().value);
+}
+// The 60-second display lasts 70 actual seconds: 55 normal + five 3-second ticks.
+const PROMO_INTERVAL=7*60*1000, PROMO_DURATION=55*1000+5*3000, WAIT_DURATION=25*1000+5*3000;
+let promoStartAt=null, promoNextAt=null;
+function promoSnapshot(){return {type:'promo',startAt:promoStartAt,endAt:promoStartAt==null?null:promoStartAt+PROMO_DURATION,nextAt:promoNextAt,serverNow:Date.now()};}
+function promoTick(){
+  const now=Date.now();
+  if(!state.connected || !queueRules.enabled){
+    if(promoStartAt!==null || promoNextAt!==null){promoStartAt=null;promoNextAt=null;broadcast(promoSnapshot());}
+    return;
+  }
+  if(promoNextAt==null){promoNextAt=now+PROMO_INTERVAL;broadcast(promoSnapshot());}
+  if(promoStartAt!==null && now>=promoStartAt+PROMO_DURATION){promoStartAt=null;broadcast(promoSnapshot());}
+  if(now>=promoNextAt){promoStartAt=now;promoNextAt=now+PROMO_INTERVAL;broadcast(promoSnapshot());}
+}
+function isPromoActive(){promoTick();return promoStartAt!==null && Date.now()<promoStartAt+PROMO_DURATION;}
+function isHandHeart(name,id){return key(name).includes('handheart') || ['5660','5924','6968','8343'].includes(String(id || ''));}
 function queueChat(who,comment){
   if(!queueRules.enabled || !who) return;
-  const fn=parseChatName(comment); if(!fn) return;
-  state.usernamesFound++;
-  const existing=queue.find(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
-  if(existing){ existing.fn=fn; }
+  const fn=parseChatName(comment);if(!fn) return;
+  state.usernamesFound++;rememberName(who,fn);
+  // Fill every unfulfilled request from this viewer, including timed-out gifts.
+  const entries=queue.filter(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
+  if(entries.length){for(const entry of entries){entry.fn=fn;entry.waitStartedAt=null;}}
   else if(activeRequest && sameUser(activeRequest.who,who)) return;
-  else if(queue.length<MAX_QUEUE){ queue.push({id:String(nextQueueId++),who,fn,bundle:1,gift:null,priority:false}); }
+  else if(queue.length<MAX_QUEUE) queue.push({id:String(nextQueueId++),who,fn,bundle:1,gift:null,priority:false});
   queueEvent();
 }
 function queueGift(who,name,id){
   if(!queueRules.enabled || !who) return;
-  const bundle=matchGift(name,id);if(bundle<0) return;
-  const index=queue.findIndex(x=>sameUser(x.who,who) && x.id!==activeRequest?.id);
-  let entry=index>=0 ? queue.splice(index,1)[0] : null;
+  const special=isHandHeart(name,id) && isPromoActive();
+  const bundle=special ? 0 : matchGift(name,id);if(bundle<0) return;
+  // Convert a queued ordinary request if present; never collapse multiple separate gifts.
+  const i=queue.findIndex(x=>sameUser(x.who,who) && !x.priority && x.id!==activeRequest?.id);
+  let entry=i>=0 ? queue.splice(i,1)[0] : null;
   if(!entry && queue.length>=MAX_QUEUE) return;
-  if(!entry) entry={id:String(nextQueueId++),who,fn:activeRequest && sameUser(activeRequest.who,who) ? activeRequest.fn : null};
-  entry.bundle=bundle;entry.gift=name;entry.priority=true;
-  queue.unshift(entry);queueEvent();
+  if(!entry) entry={id:String(nextQueueId++),who,fn:null};
+  entry.fn=entry.fn || knownNames.get(userKey(who)) || (activeRequest && sameUser(activeRequest.who,who) ? activeRequest.fn : null);
+  entry.bundle=bundle;entry.gift=name;entry.priority=true;entry.promo=special;
+  entry.waitStartedAt=entry.fn ? null : Date.now();
+  // FIFO among priority gifts; all remain ahead of ordinary requests.
+  const normal=queue.findIndex(x=>!x.priority && x.id!==activeRequest?.id);
+  if(normal<0) queue.push(entry);else queue.splice(normal,0,entry);
+  queueEvent();
 }
+setInterval(promoTick,250);
 
 /* ---------- event normalisation ---------- */
 function person(user){
@@ -418,6 +453,7 @@ const server = http.createServer(async (req, res) => {
     if(!Array.isArray(body.names) || body.names.length!==3 || !Array.isArray(body.ids) || body.ids.length!==3) return json(res,400,{ok:false});
     queueRules={enabled:!!body.enabled,names:body.names.map(x=>String(x || '').slice(0,100)),ids:body.ids.map(x=>String(x || '').slice(0,50))};
     if(!queueRules.enabled) cancelActive(); else pumpQueue();
+    promoTick();
     return json(res,200,{ok:true,rules:queueRules});
   }
   if (pathname === '/api/queue' && req.method === 'GET') return json(res,200,{ok:true,items:queue,active:activeRequest,completed});
@@ -478,7 +514,8 @@ const server = http.createServer(async (req, res) => {
       type: 'status', seq: state.seq, connected: state.connected, connecting: state.connecting,
       username: state.username, viewers: state.viewers, demo: state.demo, error: state.error
     }) + '\n\n');
-    res.write('data: ' + JSON.stringify({type:'queue',items:queue}) + '\n\n');
+    res.write('data: ' + JSON.stringify({type:'queue',items:queue,serverNow:Date.now()}) + '\n\n');
+    res.write('data: ' + JSON.stringify(promoSnapshot()) + '\n\n');
     res.write('data: ' + JSON.stringify({type:'history',items:completed}) + '\n\n');
     if(activeRequest){
       res.write('data: ' + JSON.stringify({type:'auto_started',item:activeRequest}) + '\n\n');
